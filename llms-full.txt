@@ -8611,6 +8611,7 @@ If you want to fix a bug or add an enhancement to the core project, start with t
 - [Fork and Branch Git Workflow](./git-workflow)
 - [Common Issues](./common-issues)
 - [Changing the Database](./changing-the-database)
+- [Changes that need a design discussion first](./design-discussion)
 
 If your change adds or changes Application Dictionary records, you need centralized IDs before you start. See [Request centralized IDs](./changing-the-database/centralized-ids.md).
 
@@ -8665,6 +8666,56 @@ If you have questions about how the code works or how to approach a change, ask 
 iDempiere is a community-driven open source project and a volunteer effort. If you want to help, there is room for you to contribute.
 
 See the [contributors graph](https://github.com/idempiere/idempiere/graphs/contributors) and join the team.
+
+---
+
+## Changes that need a design discussion first
+
+This page is part of the list of contribution paths described in [Contributing to iDempiere](./contributing-to-idempiere).
+
+### Why this matters
+
+Most pull requests are easy to judge. A bug is fixed or it isn't. Tests pass or they don't.
+
+Some changes are different. They shape iDempiere for everyone who installs it, often for years. Reviewing them is not about whether the code works. It is about whether the project wants the change at all. Those decisions are hard to make inside a pull request review, and they are unfair to the contributor if they happen only after the work is done.
+
+So for these changes we ask for one thing: talk about it before you build it.
+
+### What counts as a design-level change
+
+Your change needs a design discussion first if it does any of the following:
+
+- Adds or changes Application Dictionary content in core: tables, columns, windows, processes. This is a shared namespace and effectively permanent for every installation. See [Changing the Database](./changing-the-database).
+- Changes a public API or extension point that plugins build on.
+- Changes default behavior, so an existing install behaves differently after upgrade with no configuration change. This is usually discouraged.
+- Introduces a new dependency: a library, a database feature, a Java version or a build tool.
+- Adds a second way to do something that already exists, or introduces a new architectural pattern.
+- Adds a new configuration point, such as a SysConfig key or a preference. Each one is permanent surface area that someone maintains.
+- Removes or deprecates anything.
+- Contains a migration script that touches existing data.
+- Is hard to revert once released.
+
+:::tip
+
+Not sure? Treat it as design-level. A short message costs less than a rejected pull request.
+
+:::
+
+### How it works
+
+1. Start a discussion in the Mattermost [meeting channel](https://mattermost.idempiere.org/idempiere/channels/meeting) before writing the code. Describe the problem, the use case and the approach you have in mind. A Jira ticket is welcome too, but the conversation happens on Mattermost.
+2. Give people time to respond. Core developers and implementers will comment, ask questions or suggest alternatives.
+3. You can bring the topic to the weekly Friday meeting at any time, even before you post it anywhere else, and ask for a review or a decision.
+4. Get an outcome. The answer can be yes, yes with changes, or no.
+5. Open the pull request and link the discussion in the description.
+
+### "No" is a valid outcome
+
+The project can decline a proposal. When it does, the answer comes with a reason and is published in the discussion thread. A "no" is about fit for the core project, not about the quality of your work. Many declined ideas work well as a [plugin](./plugin-guidelines).
+
+### Using AI tools to contribute
+
+The agent skills in the core repository give the same guidance. If an AI assistant helps you write a design-level change, it should point you to Mattermost first. The rule is the same either way. See [Using AI Agents](./using-ai-agents).
 
 ---
 
@@ -8848,6 +8899,12 @@ This is a checklist of the **minimum steps** required to submit high-quality pul
 If your contribution includes database changes, follow the [Changing the Database](./changing-the-database) instructions **before writing any code**.
 :::
 
+:::tip
+
+If your change shapes iDempiere for everyone, for example it changes a public API, default behavior or the Application Dictionary, discuss it on Mattermost first. See [Changes that need a design discussion first](./design-discussion).
+
+:::
+
 ### Contribution Checklist
 
 - **Every commit must be related to a JIRA ticket.**  
@@ -8975,6 +9032,8 @@ This page is part of the list of contribution paths described in [Contributing t
 These guidelines cover both completely new features and smaller improvements to existing functionality.
 
 Following them helps the community understand your proposal, find related suggestions, and decide whether the idea belongs in the core project.
+
+If you plan to implement the change yourself, check whether it needs a design discussion before you write code. See [Changes that need a design discussion first](./design-discussion).
 
 Before creating an enhancement suggestion, review the points below and include as much detail as possible.
 
@@ -18706,6 +18765,225 @@ The exporter falls back to static values in the following cases:
 
 ---
 
+## Support for insert into ... returning
+
+**Goal:** Technical  
+**Developer:** [Heng Sin Low](https://github.com/hengsin)  
+**Feature Ticket:** [IDEMPIERE-7204](https://idempiere.atlassian.net/browse/IDEMPIERE-7204)  
+**Version:** iDempiere 14
+
+### The problem
+
+When saving a new persistent object (`PO`) in iDempiere, `PO.save()` generated an `INSERT INTO` statement and executed it with `DB.executeUpdate(...)`.
+
+To initialize default values, sequence IDs, database defaults, and audit timestamps, the persistence layer immediately executed a separate `SELECT` query via `PO.load(m_trxName)`:
+
+```sql
+SELECT * FROM TableName WHERE TableName_ID = ?
+```
+
+When centralized IDs were not used and the primary key was generated by the database sequence, an extra query was also executed to find the generated record ID by its UUID before reloading.
+
+In high-concurrency environments or high-volume data imports (such as REST API batch operations and automated document processing), this separate `SELECT` round-trip for every inserted record increased database round-trips, network latency, and transaction duration.
+
+### What changed
+
+iDempiere now supports the `INSERT INTO ... RETURNING *` SQL clause for database dialects that provide it, such as PostgreSQL.
+
+When inserting a new `PO` record without explicitly specified ID values:
+
+1. The persistence engine appends `RETURNING *` to the insert SQL statement.
+2. The statement executes through `DB.executeInsertReturning(...)`, returning a `ResultSet` with the newly created row.
+3. The `PO` instance populates its internal fields directly from that `ResultSet` using `load(rs)`.
+4. For tables without LOB columns, the subsequent `SELECT` query (`load(m_trxName)`) is completely bypassed.
+5. If the record ID is already populated by the returned row, the additional UUID lookup query is also omitted.
+
+If the active database dialect does not support `RETURNING *` (such as Oracle), `PO` automatically falls back to the previous `DB.executeUpdate(...)` and `load(m_trxName)` sequence.
+
+This ticket also includes related concurrency and performance improvements:
+
+- **Table caching:** Added a table name cache (`s_cacheByName`) in `MTable` and removed class-level synchronization locks from `MTable.get(...)`.
+- **Index lookup caching:** Added `MTableIndex.get(Properties, int, String)` to cache unique constraint index lookups.
+- **Recent item concurrency:** Made `m_label` in `MRecentItem` volatile and removed synchronized locks from `clearLabel`.
+- **Workflow caching:** Cached document value workflows in `MWorkflow.getDocValue` using an unmodifiable map without synchronization blocks.
+- **Changelog configuration lookup:** Moved the `SYSTEM_INSERT_CHANGELOG` system configuration lookup outside the column processing loop in `PO.saveNew()`.
+
+### How to set it up
+
+No manual setup or database migration is required.
+
+The feature activates automatically when iDempiere connects to a PostgreSQL database. On databases without `RETURNING *` support, the previous save and reload mechanism continues to operate without changes.
+
+If a specific custom table or model cannot use `RETURNING *` (for example, a table with custom triggers, rules, or views that restrict `RETURNING`), developers can disable it for that model by overriding `is_UseInsertReturning()`.
+
+### Technical notes
+
+The core persistence and database abstraction layers introduce the following methods:
+
+#### Database dialect capability
+
+The `org.compiere.db.AdempiereDatabase` interface adds:
+
+```java
+public default boolean isInsertReturningSupported() {
+    return false;
+}
+```
+
+`DB_PostgreSQL` overrides this method to return `true`. `DB_Oracle` returns `false`.
+
+#### Database helper methods
+
+The `org.compiere.util.DB` class adds:
+
+```java
+public static boolean isInsertReturningSupported();
+
+public static boolean executeInsertReturning(
+    String sql,
+    Object[] params,
+    String trxName,
+    Function<ResultSet, Boolean> loader
+);
+
+public static boolean executeInsertReturning(
+    String sql,
+    Object[] params,
+    String trxName,
+    Function<ResultSet, Boolean> loader,
+    int timeOut
+);
+```
+
+The method executes the insert statement as a query using `CPreparedStatement.executeQuery()`, advances to the first returned row (`rs.next()`), and passes the result set to the provided loader function.
+
+#### Model extension point
+
+The `org.compiere.model.PO` class adds:
+
+```java
+protected boolean is_UseInsertReturning() {
+    return DB.isInsertReturningSupported();
+}
+```
+
+Custom model classes can override `is_UseInsertReturning()` to return `false` if `RETURNING *` must be disabled for that specific table.
+
+### Migration impact
+
+None. Existing models and plug-ins remain backward compatible. Databases that do not support `INSERT INTO ... RETURNING *` continue to use the standard insert and reload sequence.
+
+### Related tickets
+
+- [IDEMPIERE-7204](https://idempiere.atlassian.net/browse/IDEMPIERE-7204)
+
+---
+
+## Lazy generate document numbers from sequence
+
+**Goal:** Technical  
+**Developer:** [Heng Sin Low](https://github.com/hengsin)  
+**Feature Ticket:** [IDEMPIERE-7185](https://idempiere.atlassian.net/browse/IDEMPIERE-7185)  
+**Version:** iDempiere 14
+
+### The problem
+
+When creating documents such as sales orders, purchase orders, invoices, material receipts, shipments, or payments, iDempiere traditionally generates the document number from the sequence table (`AD_Sequence`) as soon as the header record is first saved.
+
+Updating the sequence row acquires an exclusive row lock on that sequence record. Because this lock occurs at the beginning of document creation, the transaction holds the lock across its entire lifecycle. This includes creating line items, calculating taxes, updating storage reservations, running workflows, and executing business logic.
+
+Under high-volume workloads or concurrent transactions (such as web store integrations, EDI processing, or point-of-sale checkouts), threads queue up waiting for the sequence lock. When lock contention exceeds the timeout specified by `MSEQUENCE_GETNEXT_TIMEOUT` (default 30 seconds), transactions fail with a `GenerateDocumentNoTimeOut` error.
+
+### What changed
+
+This feature introduces lazy generation of document numbers from sequences:
+
+- When a new document record is saved, iDempiere assigns a temporary document number instead of querying and locking `AD_Sequence`. The temporary number uses the prefix `@TMP-` followed by a base64-encoded UUIDv7, which fits within standard 30-character document number columns.
+- Generation of the actual document number from `AD_Sequence` is deferred until:
+  1. The transaction pre-commit phase (`beforeCommit` transaction event), or
+  2. Business logic explicitly reads the document number via `getDocumentNo()`.
+- When business logic does not read the document number during processing, the duration of the sequence lock is shortened to the brief moment just before database commit, minimizing lock contention among concurrent transactions. If code calls `getDocumentNo()` earlier in the transaction, the sequence is locked at that point and held until the transaction completes or rolls back.
+- If a transaction rolls back before commit, the temporary document number is discarded and the sequence record is never queried or updated. This avoids burning sequence numbers or blocking other transactions.
+- When the sequence generates the actual document number, related records created earlier in the transaction that captured the temporary number are updated automatically:
+  - `AD_ChangeLog`: The insert change log entry for the `DocumentNo` column is updated to record the actual document number.
+  - `M_StorageReservationLog`: Storage reservation log entries recorded during order or receipt processing are updated with the actual document number.
+
+### How to set it up
+
+Lazy document number generation can be enabled tenant-wide, or configured individually for specific document types.
+
+#### Configure tenant-wide lazy generation
+
+To configure lazy document number generation across the system or for a specific Tenant:
+
+1. Open the System Configurator window as a System Administrator or Tenant Administrator.
+2. Search for the `LAZY_GENERATE_DOCUMENTNO_FROM_SEQUENCE` configuration key.
+3. Configure the setting:
+   - **For a system-wide setting:** Select the existing record under the "System" Tenant and set **Configured Value** to `Y`.
+   - **For a tenant-only setting:** Create a copy of the record for the specific Tenant, and set **Configured Value** to `Y` (to enable) or `N` (to disable).
+4. Save the record and reset the cache.
+
+![System Configurator setting](/img/docs/new-features/LazyGenerateDocNo_SystemConfigurator.png)
+
+#### Configure per document type
+
+You can override or configure lazy generation on specific Document Types:
+
+1. Open the Document Type window.
+2. Select the Document Type record (such as "Standard Order").
+3. Verify that **Document is Number Controlled** is checked and **Overwrite Sequence on Complete** is unchecked.
+4. Set the **Lazy Generate Document No** field:
+   - Leave empty (null) to follow the tenant-level `LAZY_GENERATE_DOCUMENTNO_FROM_SEQUENCE` configuration.
+   - Select `Yes` to enable lazy generation for this document type, even if the tenant setting is `N`.
+   - Select `No` to disable lazy generation for this document type, even if the tenant setting is `Y`.
+5. Save the record.
+
+![Document Type configuration](/img/docs/new-features/LazyGenerateDocNo_DocumentType.png)
+
+### Configuration
+
+| System Configurator key | Default | Level | What it does |
+| --- | --- | --- | --- |
+| `LAZY_GENERATE_DOCUMENTNO_FROM_SEQUENCE` | `N` | Client | Defers generation of `DocumentNo` from sequence to transaction pre-commit when set to `Y`. |
+
+#### Precedence and bypass rules
+
+- **Document Type override:** Setting **Lazy Generate Document No** on a Document Type explicitly to `Yes` or `No` takes precedence over `LAZY_GENERATE_DOCUMENTNO_FROM_SEQUENCE`.
+- **Overwrite Sequence on Complete:** If **Overwrite Sequence on Complete** (`IsOverwriteSeqOnComplete`) is checked on the Document Type, lazy generation is bypassed. The initial save uses immediate numbering or temporary numbering according to sequence rules, and the final sequence number is assigned when the document is completed.
+- **Not number controlled:** If **Document is Number Controlled** (`IsDocNoControlled`) is unchecked, no document sequence is used.
+- **Definite sequence requests:** When code explicitly requests a definitive document number (`definite=true`) or when SQL logging scripts are generated (`isLogSQLScript()`), lazy generation is bypassed.
+- **UUID Sequence:** If a Document Type is using a **UUID Sequence**, lazy generation is bypassed.
+
+### Technical notes
+
+For core and plugin developers:
+
+- **Temporary DocumentNo format:** Formatted as `MSequence.TEMP_DOCUMENTNO_PREFIX` (`@TMP-`) concatenated with a 22-character URL-safe Base64 representation of a 16-byte UUIDv7.
+- **`MSequence` helper methods:**
+  - `MSequence.isTemporaryDocumentNo(String documentNo)`: Returns `true` if the string starts with `@TMP-`.
+  - `MSequence.isUsingTemporaryDocumentNo(PO po)`: Checks whether a persistent object holds a pending temporary document number.
+  - `MSequence.getDocumentNo(int C_DocType_ID, String trxName, boolean definite, PO po, boolean deferToPreCommit)`: Overloaded method that accepts `deferToPreCommit`.
+  - `MSequence.getDocumentNo(int AD_Client_ID, String TableName, String trxName, PO po, boolean deferToPreCommit)`: Overloaded method for table-level sequences.
+- **`PO` methods:**
+  - `po.is_UsingTemporaryDocumentNo()`: Checks if the current `PO` instance holds a temporary document number.
+  - `po.get_TemporaryDocumentNo()`: Returns the temporary document number without triggering sequence generation.
+  - `po.addDeferredDocumentNoCallback((tempDocNo, actualDocNo) -> ...)`: Registers a callback invoked when the actual document number is generated.
+  - Calling `po.getDocumentNo()` or `po.get_Value("DocumentNo")` triggers sequence generation immediately if deferred generation is still pending.
+- **Transaction pre-commit event:**
+  - `Trx` fires `beforeCommit(Trx trx)` on all registered `TrxEventListener` listeners prior to committing the database connection.
+  - If a `beforeCommit` listener throws an exception, the transaction is safely rolled back.
+
+### Migration impact
+
+None. This feature is disabled by default (`LAZY_GENERATE_DOCUMENTNO_FROM_SEQUENCE` defaults to `N` and `C_DocType.IsLazyGenerateDocNo` defaults to `null`). Existing installations continue generating document numbers immediately unless the feature is explicitly enabled.
+
+### Related tickets
+
+- [IDEMPIERE-7185](https://idempiere.atlassian.net/browse/IDEMPIERE-7185)
+- [IDEMPIERE-7120](https://idempiere.atlassian.net/browse/IDEMPIERE-7120)
+
+---
+
 ## Model generator for custom columns
 
 **Goal:** Technical  
@@ -19218,6 +19496,147 @@ Otherwise, a new AD_Session is created.
 **Important Notes**
 - The Web Session Logic must evaluate to a stable value to benefit from reuse.
 - If the expression changes between executions, a new session will be created.
+
+---
+
+## Server Push Reconnect (Atmosphere)
+
+**Goal:** Technical  
+**Developer:** [Norbert Bede](https://github.com/norbertbede), [Heng Sin Low](https://github.com/hengsin)  
+**Feature Ticket:** [IDEMPIERE-7205](https://idempiere.atlassian.net/browse/IDEMPIERE-7205)  
+**Version:** iDempiere 14
+
+### Overview
+
+Before this change, the Atmosphere server push gave up after 3 failed requests within about 1 second and showed a blocking browser alert: "The page or component you request is no longer available. This is normally caused by timeout or rebooting the server." A proxy reload, a short network problem or a load balancer returning 502/503 during a deployment was enough to trigger it, even on the login page.
+
+Now the browser:
+
+- retries with increasing waits, so a short outage passes without the user noticing;
+- reloads the page without an alert when the server stays unreachable, so a reverse proxy or load balancer can show its maintenance page;
+- stops quietly when the server reports that the session or desktop no longer exists;
+- detects a server that accepts connections but never answers.
+
+This page applies only to the Atmosphere implementation (`-Dorg.idempiere.ui.zk.serverpush=atmosphere`). The default WebSocket implementation is not changed. See [Migration notes - iDempiere 14 (technical)](/docs/migration-notes/v14/technical-notes) for how to choose between them.
+
+### How the long poll works
+
+1. The browser sends `POST /webui/zkau/comet` for its desktop.
+2. The server holds the request open until it has something to push, or until the push timeout ends (2 minutes by default).
+3. The server answers with HTTP 200 in both cases.
+4. The browser sends the next request right away.
+
+The browser also has its own timeout: the push timeout plus 30 seconds. It fires only when the server or the network does not answer at all.
+
+### What the browser does with each answer
+
+| Answer | Meaning | Counted as a failure | Next request |
+|---|---|---|---|
+| HTTP 200 | Push data or normal end of an idle poll | No, the counter goes back to 0 | Right away |
+| No answer (network error, status 0) | Server or network unreachable | Yes | After the backoff wait |
+| HTTP 5xx (502, 503, 504...) | Proxy or load balancer cannot reach the server | Yes | After the backoff wait |
+| Browser timeout (push timeout + 30 s) | Server accepts the connection but does not answer | Yes | After the backoff wait |
+| HTTP 400 with header `X-Atmosphere-Error: SessionNotFound` or `DesktopNotFound` | Server is up, but the session or desktop has ended | No | None, server push stops |
+| Other HTTP 4xx | Request rejected | Yes | Right away, without a wait |
+
+The backoff wait doubles after each failure: 1, 2, 4 and 8 seconds. After the 5th failure in a row the browser stops polling and loads `index.zul` with a full page request. No alert is shown.
+
+The session error is sent in the `X-Atmosphere-Error` header because the HTTP status text (for example "SessionNotFound") is not available over HTTP/2 and is replaced by some proxies.
+
+### Examples
+
+Short outage, for example a proxy reload of 6 seconds:
+
+| Time | Event |
+|---|---|
+| 0 s | Proxy starts returning 503 |
+| 0 s | Request fails (failure 1), wait 1 s |
+| 1 s | Request fails (failure 2), wait 2 s |
+| 3 s | Request fails (failure 3), wait 4 s |
+| 7 s | Server is back, request succeeds, counter back to 0 |
+
+The user keeps the page and any unsaved input.
+
+Lasting outage, for example a server restart:
+
+| Time | Event |
+|---|---|
+| 0 s | First failed request, wait 1 s |
+| 1 s | Failure 2, wait 2 s |
+| 3 s | Failure 3, wait 4 s |
+| 7 s | Failure 4, wait 8 s |
+| 15 s | Failure 5: the browser loads `index.zul` |
+
+While the server is down, the proxy answers the page request with its maintenance page. A static maintenance page does not return to iDempiere by itself: the user reloads the page, or the maintenance page reloads itself after a short delay (see [Maintenance page](#maintenance-page)). When the server is back, the user gets the login page. The in-memory session is lost after a restart in any case, so waiting longer would not help.
+
+### Session timeout
+
+A real session timeout is handled by ZK, not by the retry logic above. By default the browser shows `timeout.zul`, as set by `timeout-uri` in `WEB-INF/zk.xml`. If `timeout-message` is used instead, `jawwa.atmosphere.sessionTimeout()` still shows the alert with the "SessionTimeoutText" message and then loads `index.zul`.
+
+### Configuration
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `-Dorg.idempiere.ui.zk.serverpush=atmosphere` | WebSocket | Selects the Atmosphere implementation |
+| `-Dfi.jawsy.jawwa.zk.atmosphere.timeout=<milliseconds>` | `120000` | Push timeout: how long the server holds an idle poll |
+
+Add both to "Java Options" when running iDempiere setup, or to `JAVA_OPTIONS` for the Docker image. The push timeout can also be set as a ZK library property in `WEB-INF/zk.xml`. The retry count and the backoff waits are fixed.
+
+### Running behind a reverse proxy or load balancer
+
+#### Read timeout
+
+Every proxy between the browser and iDempiere must keep the comet request open longer than the push timeout. Otherwise the proxy ends the idle poll first with 504, which counts as a failure. If this happens on 5 polls in a row, the idle page reloads.
+
+| Component | Setting | Default |
+|---|---|---|
+| nginx | `proxy_read_timeout` | 60 s |
+| Apache httpd (`mod_proxy`) | `ProxyTimeout` | Value of `Timeout`, 60 s |
+| AWS Application Load Balancer | `idle_timeout.timeout_seconds` | 60 s |
+| AWS CloudFront | Origin response timeout | 30 s |
+
+Either raise the proxy timeout above the push timeout, or lower the push timeout below the smallest proxy timeout in the chain. For example, behind nginx or an Application Load Balancer with default settings (60 s), `-Dfi.jawsy.jawwa.zk.atmosphere.timeout=50000` keeps idle polls below 60 seconds. Behind CloudFront, first raise its origin response timeout above the push timeout, or set the push timeout below 30 seconds, for example `25000`.
+
+:::tip
+Leave a margin. If the proxy timeout and the push timeout are equal, the proxy often answers first.
+:::
+
+#### Maintenance page
+
+After the 5th failure the browser loads `index.zul` with a normal page request, so a maintenance page configured for 502, 503 and 504 is shown to the user. Keep a 5xx status on the maintenance response: a 200 would look like a successful poll.
+
+nginx example:
+
+```nginx
+error_page 502 503 504 /maintenance.html;
+
+location = /maintenance.html {
+    root /usr/share/nginx/html;
+    internal;
+}
+
+location /webui/ {
+    proxy_pass http://idempiere:8080;
+    proxy_read_timeout 180s;
+    # also use error_page for 502/503/504 returned by iDempiere itself
+    proxy_intercept_errors on;
+}
+```
+
+To bring users back without a manual reload, the maintenance page can reload itself, for example with `<meta http-equiv="refresh" content="30">`.
+
+On AWS CloudFront, use custom error responses for 502, 503 and 504 that point to the maintenance page and return 503.
+
+### Before and after
+
+| | Before | After |
+|---|---|---|
+| Failures before giving up | 3, within 1 second | 5, over about 15 seconds |
+| Alert on a server outage | Yes, the tab is blocked until OK is clicked | No |
+| End state of a lasting outage | `index.zul` after OK | `index.zul` directly, or the proxy maintenance page |
+| Session or desktop gone | Detected only from the HTTP status text | Detected from the `X-Atmosphere-Error` header |
+| Server not answering | Not detected | Counted after push timeout + 30 s |
+| Alert on a real session timeout (`timeout-message`) | Yes | Yes, unchanged |
 
 ---
 
